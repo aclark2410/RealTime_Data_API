@@ -1,101 +1,120 @@
 import pandas as pd
-from collections import defaultdict
-from datetime import timedelta, datetime
-import matplotlib.pyplot as plt
 import numpy as np
-import mplfinance as mpf
+import matplotlib.pyplot as plt
+import databento as db
 
-# Load the data from a CSV file
-df = pd.read_csv('sp500_5years.csv', index_col='Date', parse_dates=True)
+# Function to create price bins with a specified step size
+def create_price_bins(df, step=0.05):
+    """Creates price bins with specified step size."""
+    df['price_bins'] = np.floor(df['close'] / step) * step
+    return df
 
-# Define the range of days you want to process
-start_date = datetime(2018, 1, 2)
-end_date = datetime(2022, 12, 30)  # Example: Process 5 days of data
+# Function to calculate TPO blocks for a single year
+def calculate_tpo_blocks(df, time_delta_minutes=30):
+    """Calculates TPO blocks for each price level and returns a TPO dictionary."""
+    df.index = pd.to_datetime(df.index)  # Ensure the index is in datetime format
+    df = df.dropna(subset=['close'])  # Remove rows with missing close prices
+    
+    # Initialize the TPO dictionary and timestamp tracker
+    tpo_dict = {}
+    last_tpo_timestamp = {}
+    time_delta = pd.Timedelta(minutes=time_delta_minutes)  # Set the time delta (default: 30 minutes)
 
-# Filter the DataFrame to only include data within the specified date range
-df = df[(df.index >= start_date) & (df.index <= end_date)]
-
-# Loop through each day and process data
-current_date = start_date
-while current_date <= end_date:
-    next_date = current_date + timedelta(days=1)
-    
-    # Filter data for the current day
-    df_day = df[(df.index >= current_date) & (df.index < next_date)]
-    
-    # Ensure the DataFrame is sorted by the index (timestamp)
-    df_day.sort_index(inplace=True)
-    
-    # Initialize the TPO dictionary
-    tpo_dict = defaultdict(int)
-    
-    # Track the current 30-minute period start
-    current_period_start = df_day.index[0]
-    time_frame = timedelta(minutes=30)
-    
-    # Initialize a set to track prices within the current time frame
-    current_time_frame_prices = set()
-    
-    # Iterate through the DataFrame to calculate TPO blocks
-    for timestamp, row in df_day.iterrows():
-        price = row['Close']  # Use the 'Close' price for TPO
+    # Iterate over each row (1-minute intervals)
+    for idx, row in df.iterrows():
+        price_bin = row['price_bins']
+        current_time = idx  # Timestamp (from df.index)
         
-        # Check if we are still within the same 30-minute time frame
-        if timestamp >= current_period_start + time_frame:
-            # Reset for the new time frame
-            current_period_start += time_frame
-            current_time_frame_prices.clear()
-        
-        # If the price hasn't been added to the TPO block in this time frame, update the TPO dictionary
-        if price not in current_time_frame_prices:
-            tpo_dict[price] += 1
-            current_time_frame_prices.add(price)
-    
-    # Get the full range of prices traded during this period
-    min_price = df_day['Close'].min()
-    max_price = df_day['Close'].max()
-    price_range = np.arange(min_price, max_price + 0.25, 0.25)  # Assuming tick size is 0.25
-    
-    # Create a TPO vector with 0s for prices that were not traded
-    tpo_vector = np.array([tpo_dict[price] if price in tpo_dict else 0 for price in price_range])
-    
-    # Resample the original data to 30-minute intervals for candlestick plotting
-    ohlc_dict = {
-        'Open': 'first',
-        'High': 'max',
-        'Low': 'min',
-        'Close': 'last',
-        'Volume': 'sum'
-    }
-    df_30min = df_day.resample('30min').agg(ohlc_dict)
-    df_30min.dropna(inplace=True)
-    
-    # Plot TPO Profile and Candlestick Chart for the Current Day
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 8))
-    
-    # Plot the TPO histogram on the first subplot
-    ax1.barh(price_range, tpo_vector, color='blue')
-    ax1.set_xlabel('TPO Blocks')
-    ax1.set_ylabel('Price Levels')
-    ax1.set_title(f'TPO Chart - {current_date.strftime("%Y-%m-%d")}')
-    ax1.grid(True)
-    
-    # Plot the 30-minute candlestick chart on the second subplot (without volume bars)
-    mpf.plot(
-        df_30min,
-        type='candle',
-        ax=ax2,  # Candlestick plot on the price axis
-        style='charles',
-        ylabel='Price',
-        show_nontrading=False,
-        xrotation=15  # Adjust to your preference
-    )
-    
-    # Manually set the title for the candlestick plot
-    ax2.set_title(f'Candlestick Chart - {current_date.strftime("%Y-%m-%d")}')
-    
+        # Check if this price level has been seen before
+        if price_bin not in last_tpo_timestamp:
+            tpo_dict[price_bin] = 1  # First occurrence of this price level
+            last_tpo_timestamp[price_bin] = current_time
+        else:
+            # Increment the TPO count if enough time (30 minutes) has passed
+            if current_time - last_tpo_timestamp[price_bin] >= time_delta:
+                tpo_dict[price_bin] += 1
+                last_tpo_timestamp[price_bin] = current_time  # Update the last timestamp
+
+    return tpo_dict
+
+# Function to create and plot TPO histograms for multiple years side by side
+def plot_tpo_profiles_side_by_side(tpo_dicts, years):
+    """Plots TPO profiles for multiple years side by side."""
+    # Get all unique price levels from all years (sorted in descending order)
+    all_prices = sorted(set(price for tpo_dict in tpo_dicts for price in tpo_dict.keys()), reverse=True)
+
+    # Create a matrix to store TPO counts for each price level and year
+    tpo_matrix = np.zeros((len(all_prices), len(tpo_dicts)))
+
+    # Populate the matrix with TPO counts
+    for col, tpo_dict in enumerate(tpo_dicts):
+        for price, tpo_count in tpo_dict.items():
+            row = all_prices.index(price)
+            tpo_matrix[row, col] = tpo_count
+
+    # Plot the TPO histograms side by side
+    plt.figure(figsize=(12, 8))
+    offset = 0
+    for col in range(len(tpo_dicts)):
+        plt.step(tpo_matrix[:, col] + offset, all_prices, where='mid', label=f'TPO {years[col]}', marker='o')
+        offset += 10  # Shift each year's plot to the right
+
+    # Customize the plot
+    plt.title('TPO Market Profile Comparison by Year')
+    plt.xlabel('Number of TPO Blocks (Offset for Each Year)')
+    plt.ylabel('Price Level')
+    plt.grid(True, axis='x')
+    plt.legend()
     plt.tight_layout()
     plt.show()
+
+# Function to get data from the API for a specific year
+def get_data_for_year(start, end, dataset="GLBX.MDP3", symbol="CLX4"):
+    """Retrieves data from the Databento API for a specific time range."""
+    client = db.Historical(key="db-HsLUpjXU6TLxiHeEATVeeyWYk5mwe")  # Initialize the API client with your API key
+    data = client.timeseries.get_range(
+        dataset=dataset,
+        symbols=symbol,
+        schema="ohlcv-1m",
+        start=start,
+        end=end
+    )
+    df = pd.DataFrame(data)  # Convert the data to a DataFrame
     
-    # Move to the next day
-    current_date = next_date
+    # Print the columns to inspect the structure of the data returned by the API
+    print(df.columns)
+    
+    return df
+
+# Main function to run the process for multiple years
+def process_years_data(years, dataset, calendar_years):
+    """Processes multiple years of data and generates side by side TPO profiles."""
+    tpo_dicts = []
+
+    # Use zip to iterate over both years and calendar_years
+    for year, calendar_year in zip(years, calendar_years):
+        start = f'{year}-01-01'
+        end = f'{year}-12-31'
+        symbol = f'CLX{calendar_year}'  # Construct the symbol using the calendar year
+
+        # Step 1: Retrieve the data for this year from the API
+        df = get_data_for_year(start, end, dataset=dataset, symbol=symbol)
+        
+        # Step 2: Apply price binning
+        df = create_price_bins(df, step=0.05)
+        
+        # Step 3: Calculate TPO blocks for this year
+        tpo_dict = calculate_tpo_blocks(df)
+        
+        # Store the TPO dictionary
+        tpo_dicts.append(tpo_dict)
+
+    # Step 4: Plot the TPO profiles for all years
+    plot_tpo_profiles_side_by_side(tpo_dicts, years)
+
+# Example usage:
+years = ['2020', '2021', '2022']  # List of years to process
+calendar_years = ['0', '1', '2']  # Calendar year suffixes for the symbol
+
+# Process and plot TPO profiles for multiple years
+process_years_data(years, "GLBX.MDP3", calendar_years)
